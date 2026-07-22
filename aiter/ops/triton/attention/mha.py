@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 from typing import Literal, Optional, Tuple, Union
 import torch
 import triton
@@ -72,6 +73,7 @@ def _flash_attn_forward(
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
     sink: Optional[torch.Tensor] = None,
+    block_skip_threshold: float = 0.0,
     config: Optional[dict[str, any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int]:
 
@@ -80,6 +82,20 @@ def _flash_attn_forward(
     if _MHA_IMPL != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
     sliding_window = window_size_left if window_size_left >= 0 else 0
+
+    # BLASST block skipping (prefill). block_skip_threshold is the natural-space
+    # softmax threshold from calibration (0 disables). The kernel runs softmax in
+    # base 2, so convert to log2 units for the in-kernel comparison.
+    ENABLE_BLOCK_SKIP = block_skip_threshold > 0.0
+    if ENABLE_BLOCK_SKIP and _MHA_IMPL == "dao_ai":
+        raise ValueError(
+            "block_skip_threshold is only supported by the default MHA impl"
+        )
+    log2_threshold = (
+        math.log(block_skip_threshold) * 1.4426950408889634 # = ln(lambda) * (1/ln2)
+        if ENABLE_BLOCK_SKIP
+        else 0.0
+    )
 
     # Triton cannot specialize on numpy scalar types; ensure native Python int
     max_seqlen_q = int(max_seqlen_q)
@@ -244,6 +260,10 @@ def _flash_attn_forward(
     else:
         if config is None:
             config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
+        if ENABLE_BLOCK_SKIP:
+            # Block skipping requires the deferred V-load path so skipped blocks
+            # avoid the V read entirely.
+            config = {**config, "PRELOAD_V": False}
 
         grid = lambda META: (  # noqa: E731
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
@@ -302,6 +322,8 @@ def _flash_attn_forward(
             USE_INT64_STRIDES=_USE_INT64_STRIDES,
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
+            ENABLE_BLOCK_SKIP=ENABLE_BLOCK_SKIP,
+            log2_threshold=log2_threshold,
             # Soundness precondition: only set when every Q/K/V head-axis
             # stride is a multiple of 8 elements. q_strides[1]/k_strides[1]/
             # v_strides[1] are the head-axis strides in both thd and bshd
@@ -336,6 +358,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         sink,
         is_grad_enabled,
         config=None,
+        block_skip_threshold=0.0,
     ):
         is_grad = is_grad_enabled and any(
             x is not None and x.requires_grad for x in [q, k, v, sink]
@@ -364,6 +387,7 @@ class _FlashAttnFunc(torch.autograd.Function):
                 max_seqlen_q=q.shape[1],
                 max_seqlen_k=k.shape[1],
                 sink=sink,
+                block_skip_threshold=block_skip_threshold,
                 config=config,
             )
         )
@@ -505,6 +529,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             dsink,
             None,  # is_grad_enabled
             None,  # config
+            None,  # block_skip_threshold
         )
 
 
@@ -523,6 +548,7 @@ def flash_attn_func(
     return_attn_probs=False,
     sink=None,
     config: Optional[dict[str, any]] = None,
+    block_skip_threshold: float = 0.0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -593,6 +619,7 @@ def flash_attn_func(
         sink,
         torch.is_grad_enabled(),
         config,
+        block_skip_threshold,
     )
 
 
