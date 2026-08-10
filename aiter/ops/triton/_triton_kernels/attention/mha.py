@@ -218,7 +218,7 @@ def _attn_fwd_inner(
         # no-ops for them, and their probabilities are zeroed so they add nothing
         # to the accumulator.
         if ENABLE_BLOCK_SKIP:
-            skip = (qk_max - m_ij) < log2_threshold
+            skip = (qk_max - m_i) < log2_threshold
             all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
             m_ij = tl.where(skip, m_i, m_ij)
         else:
