@@ -92,6 +92,22 @@ def test_blasst_actually_skips(causal):
     assert r_hi > r_lo
 
 
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("thr", [1.001, 1.1, 1.3, 2.0, 4.0, 8.0, 12.0])
+def test_blasst_no_nan_above_threshold_one(causal, thr):
+    """block_skip_threshold > 1.0 (log2_threshold > 0) previously produced
+    100% NaN output: the skip decision compared qk_max against m_ij (the
+    running max AFTER folding in the current block) instead of m_i (the
+    running max BEFORE it), so qk_max - m_ij was identically 0 whenever a
+    block set a new running max -- including the first block, where m_i
+    starts at -inf. That made the first block get skipped unconditionally,
+    leaving m_i at -inf and producing exp2(-inf - (-inf)) = NaN downstream.
+    """
+    q, k, v = _qkv(1, 4096, 8, 128)
+    out = flash_attn_func(q, k, v, causal=causal, block_skip_threshold=thr)
+    assert torch.isfinite(out).all()
+
+
 # ─── standalone numbered report (mirrors scripts/test_aiter_blasst.py) ─────
 
 def main():
