@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 from typing import Literal, Optional, Tuple, Union
 import torch
 import triton
@@ -261,9 +262,12 @@ def _flash_attn_forward(
         if config is None:
             config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
         if ENABLE_BLOCK_SKIP:
-            # Block skipping requires the deferred V-load path so skipped blocks
-            # avoid the V read entirely.
-            config = {**config, "PRELOAD_V": False}
+            # Default: deferred V-load path so skipped blocks avoid the V read
+            # entirely (BLASST's main bandwidth saving). AITER_BLASST_PRELOAD_V=1
+            # preloads V instead (keeps loads pipelined but forfeits the V-load
+            # elision) — for A/B benchmarking only.
+            preload_v = os.environ.get("AITER_BLASST_PRELOAD_V", "0") == "1"
+            config = {**config, "PRELOAD_V": preload_v}
 
         grid = lambda META: (  # noqa: E731
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
