@@ -103,6 +103,11 @@ def kernel_unified_attention_2d(
     ALL_DECODE: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    # BLASST block skipping. log2_threshold is a RUNTIME scalar (not constexpr)
+    # so sweeping thresholds does not trigger a recompile per value.
+    ENABLE_BLOCK_SKIP: tl.constexpr = False,  # bool
+    PRELOAD_V: tl.constexpr = True,  # bool
+    log2_threshold=0.0,
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -328,24 +333,28 @@ def kernel_unified_attention_2d(
             )
 
         # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=v_mask,
-            other=other,
-            cache_modifier=KV_cache_modifier,
-        )
-
-        V = V_load.to(Q.dtype)
-        if SHUFFLED_KV_CACHE:
-            V = (
-                V.reshape(
-                    TILE_SIZE // K_WIDTH,
-                    HEAD_SIZE_PADDED,
-                    K_WIDTH,
-                )
-                .permute(0, 2, 1)
-                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+        # With BLASST the wrapper sets PRELOAD_V=False so this load is deferred
+        # past the skip decision below and can be elided for skipped tiles --
+        # that elision is where the memory-bandwidth saving comes from.
+        if PRELOAD_V:
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=v_mask,
+                other=other,
+                cache_modifier=KV_cache_modifier,
             )
+
+            V = V_load.to(Q.dtype)
+            if SHUFFLED_KV_CACHE:
+                V = (
+                    V.reshape(
+                        TILE_SIZE // K_WIDTH,
+                        HEAD_SIZE_PADDED,
+                        K_WIDTH,
+                    )
+                    .permute(0, 2, 1)
+                    .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                )
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -387,7 +396,28 @@ def kernel_unified_attention_2d(
 
         # compute running maximum
         # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
+        s_max = tl.max(S, axis=1)
+        m_j = tl.maximum(M, s_max)
+
+        # BLASST block skipping: a row skips this K/V tile when its per-tile max
+        # score is far below the running max. The comparison is in log2 units
+        # because S was pre-scaled by RCP_LN2 (base-2 softmax). Skipped rows keep
+        # their old running max, so the acc/L/M updates below become no-ops for
+        # them, and their probabilities are zeroed so they add nothing to acc.
+        # Compare against M (the running max BEFORE this tile), never m_j (the
+        # max AFTER folding it in) -- see BLASST_BLOCK_SKIP_NAN_FIX.md. Using
+        # m_j makes the difference identically 0 whenever a tile sets a new max,
+        # including the first tile where M is -inf, which skips it
+        # unconditionally and leaves M at -inf -> exp2(-inf - -inf) = NaN.
+        # With this form, M == -inf gives s_max - M == +inf (or NaN if s_max is
+        # also -inf), and neither is < log2_threshold, so the first tile and
+        # fully-masked rows never skip and M is always finite when skip is true.
+        if ENABLE_BLOCK_SKIP:
+            skip = (s_max - M) < log2_threshold
+            all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
+            m_j = tl.where(skip, M, m_j)
+        else:
+            all_skip = False
 
         # For sliding window there's a chance the max is -inf due to masking of
         # the entire row. In this case we need to set m_j 0 to avoid NaN
@@ -395,12 +425,18 @@ def kernel_unified_attention_2d(
 
         # P : (BLOCK_M, TILE_SIZE)
         P = tl.math.exp2(S - m_j[:, None])
+        if ENABLE_BLOCK_SKIP:
+            P = tl.where(skip[:, None], 0.0, P)
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
         alpha = tl.math.exp2(M - m_j)
+        # Defensive: skip implies m_j == M (finite), so alpha is already 1.0.
+        # Kept as cheap insurance against an inf - inf -> NaN regression.
+        if ENABLE_BLOCK_SKIP:
+            alpha = tl.where(skip, 1.0, alpha)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -410,7 +446,31 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+        # When every row skips this tile the V load and the P@V matmul
+        # contribute nothing -- elide both. When ENABLE_BLOCK_SKIP is False,
+        # all_skip is a Python False so this folds away at compile time and the
+        # dense path emits identical IR.
+        if not (ENABLE_BLOCK_SKIP and all_skip):
+            if not PRELOAD_V:
+                V_load = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=v_mask,
+                    other=other,
+                    cache_modifier=KV_cache_modifier,
+                )
+
+                V = V_load.to(Q.dtype)
+                if SHUFFLED_KV_CACHE:
+                    V = (
+                        V.reshape(
+                            TILE_SIZE // K_WIDTH,
+                            HEAD_SIZE_PADDED,
+                            K_WIDTH,
+                        )
+                        .permute(0, 2, 1)
+                        .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                    )
+            acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -454,6 +514,8 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "IS_Q_FP8",
         "IS_KV_FP8",
+        "ENABLE_BLOCK_SKIP",
+        "PRELOAD_V",
     ],
 )
 
@@ -514,6 +576,11 @@ def kernel_unified_attention_3d(
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    # BLASST block skipping. log2_threshold is a RUNTIME scalar (not constexpr)
+    # so sweeping thresholds does not trigger a recompile per value.
+    ENABLE_BLOCK_SKIP: tl.constexpr = False,  # bool
+    PRELOAD_V: tl.constexpr = True,  # bool
+    log2_threshold=0.0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -734,24 +801,27 @@ def kernel_unified_attention_3d(
             )
 
         # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=v_mask,
-            other=other,
-            cache_modifier=KV_cache_modifier,
-        )
-
-        V = V_load.to(Q.dtype)
-        if SHUFFLED_KV_CACHE:
-            V = (
-                V.reshape(
-                    TILE_SIZE // K_WIDTH,
-                    HEAD_SIZE_PADDED,
-                    K_WIDTH,
-                )
-                .permute(0, 2, 1)
-                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+        # With BLASST the wrapper sets PRELOAD_V=False so this load is deferred
+        # past the skip decision below and can be elided for skipped tiles.
+        if PRELOAD_V:
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=v_mask,
+                other=other,
+                cache_modifier=KV_cache_modifier,
             )
+
+            V = V_load.to(Q.dtype)
+            if SHUFFLED_KV_CACHE:
+                V = (
+                    V.reshape(
+                        TILE_SIZE // K_WIDTH,
+                        HEAD_SIZE_PADDED,
+                        K_WIDTH,
+                    )
+                    .permute(0, 2, 1)
+                    .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                )
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
@@ -794,7 +864,22 @@ def kernel_unified_attention_3d(
 
         # compute running maximum
         # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
+        s_max = tl.max(S, axis=1)
+        m_j = tl.maximum(M, s_max)
+
+        # BLASST block skipping -- see the 2D kernel for the full rationale.
+        # Compare against M (running max BEFORE this tile), never m_j, or
+        # thresholds > 1.0 produce NaN (BLASST_BLOCK_SKIP_NAN_FIX.md).
+        # NOTE: in this 3D kernel M is reset to -inf at the start of every
+        # segment, so skip decisions are segment-local: the first tile of each
+        # segment never skips and comparisons use a segment-local running max.
+        # Skip rates are therefore lower here than in the 2D kernel.
+        if ENABLE_BLOCK_SKIP:
+            skip = (s_max - M) < log2_threshold
+            all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
+            m_j = tl.where(skip, M, m_j)
+        else:
+            all_skip = False
 
         # For sliding window there's a chance the max is -inf due to masking of
         # the entire row. In this case we need to set m_j 0 to avoid NaN
@@ -802,12 +887,17 @@ def kernel_unified_attention_3d(
 
         # P : (BLOCK_M, TILE_SIZE,)
         P = tl.math.exp2(S - m_j[:, None])
+        if ENABLE_BLOCK_SKIP:
+            P = tl.where(skip[:, None], 0.0, P)
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
         alpha = tl.math.exp2(M - m_j)
+        # Defensive: skip implies m_j == M (finite), so alpha is already 1.0.
+        if ENABLE_BLOCK_SKIP:
+            alpha = tl.where(skip, 1.0, alpha)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -817,7 +907,29 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+        # Elide the V load and the P@V matmul when every row skips this tile.
+        # Folds away at compile time when ENABLE_BLOCK_SKIP is False.
+        if not (ENABLE_BLOCK_SKIP and all_skip):
+            if not PRELOAD_V:
+                V_load = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=v_mask,
+                    other=other,
+                    cache_modifier=KV_cache_modifier,
+                )
+
+                V = V_load.to(Q.dtype)
+                if SHUFFLED_KV_CACHE:
+                    V = (
+                        V.reshape(
+                            TILE_SIZE // K_WIDTH,
+                            HEAD_SIZE_PADDED,
+                            K_WIDTH,
+                        )
+                        .permute(0, 2, 1)
+                        .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                    )
+            acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     acc = acc * out_factor
     if NUM_SEGMENTS_PER_SEQ == 1:

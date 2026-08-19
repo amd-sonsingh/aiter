@@ -123,6 +123,8 @@ def _attn_fwd_inner(
     FP8_MAX: tl.constexpr,
     ENABLE_PIPELINING: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    ENABLE_BLOCK_SKIP: tl.constexpr,
+    log2_threshold,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
     HAS_PE: tl.constexpr = BLOCK_DMODEL_PE > 0
@@ -209,10 +211,26 @@ def _attn_fwd_inner(
             )
             qk += alibi_block * RCP_LN2
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk_max = tl.max(qk, 1)
+        m_ij = tl.maximum(m_i, qk_max)
+
+        # BLASST block skipping: a row skips this K/V block when its per-block
+        # max score is far below the running max. The comparison is in log2
+        # units because qk was pre-scaled by RCP_LN2 (base-2 softmax). Skipped
+        # rows keep their old running max, so the acc/l_i/m_i updates below become
+        # no-ops for them, and their probabilities are zeroed so they add nothing
+        # to the accumulator.
+        if ENABLE_BLOCK_SKIP:
+            skip = (qk_max - m_i) < log2_threshold
+            all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
+            m_ij = tl.where(skip, m_i, m_ij)
+        else:
+            all_skip = False
 
         # Compute scaled QK and softmax probabilities
         p = tl.math.exp2(qk - m_ij[:, None])
+        if ENABLE_BLOCK_SKIP:
+            p = tl.where(skip[:, None], 0.0, p)
 
         if SLIDING_WINDOW > 0:
             # When all qk in a row are -inf (fully out-of-window block) and m_i was -inf,
@@ -251,15 +269,23 @@ def _attn_fwd_inner(
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
         m_i = m_ij
-        if not PRELOAD_V:
-            v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
-        if IS_FP8:
-            scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
-            acc += (
-                tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v
-            )
-        else:
-            acc = tl.dot(p.to(v.type.element_ty), v, acc=acc)
+        # When every row skips this block (BLASST), the V load and the P@V matmul
+        # contribute nothing — skip both. This is where the memory-bandwidth and
+        # compute savings come from. Requires PRELOAD_V=False (forced by the
+        # wrapper when block skipping is enabled) so the V load is deferred here
+        # and can be elided.
+        if not (ENABLE_BLOCK_SKIP and all_skip):
+            if not PRELOAD_V:
+                v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
+            if IS_FP8:
+                scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
+                acc += (
+                    tl.dot((p * scale_p).to(v.type.element_ty), v)
+                    * descale_p
+                    * descale_v
+                )
+            else:
+                acc = tl.dot(p.to(v.type.element_ty), v, acc=acc)
 
         k_ptrs += BLOCK_N * stride_kn
         if HAS_PE:
@@ -366,6 +392,8 @@ def _attn_fwd(
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    ENABLE_BLOCK_SKIP: tl.constexpr,
+    log2_threshold,
     HEAD_STRIDE_ALIGNED_8: tl.constexpr = False,
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
@@ -806,6 +834,8 @@ def _attn_fwd(
             FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=True,
             SLIDING_WINDOW=SLIDING_WINDOW,
+            ENABLE_BLOCK_SKIP=ENABLE_BLOCK_SKIP,
+            log2_threshold=log2_threshold,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -871,6 +901,8 @@ def _attn_fwd(
             FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=False,
             SLIDING_WINDOW=SLIDING_WINDOW,
+            ENABLE_BLOCK_SKIP=ENABLE_BLOCK_SKIP,
+            log2_threshold=log2_threshold,
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.

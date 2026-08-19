@@ -2,6 +2,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 import math
 
+import os
 import torch
 import triton
 
@@ -358,8 +359,30 @@ def unified_attention(
     sinks=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    block_skip_threshold: float = 0.0,
 ):
     assert causal, "Only causal attention is supported"
+
+    # BLASST block skipping. block_skip_threshold is the natural-space softmax
+    # threshold from calibration (0 disables). The kernels run softmax in base
+    # 2, so convert to log2 units for the in-kernel comparison.
+    ENABLE_BLOCK_SKIP = block_skip_threshold > 0.0
+    log2_threshold = (
+        math.log(block_skip_threshold) * 1.4426950408889634  # ln(lambda) / ln(2)
+        if ENABLE_BLOCK_SKIP
+        else 0.0
+    )
+    if ENABLE_BLOCK_SKIP and IS_DEVICE_ARCH_GFX12:
+        # gfx1250 dispatches prebuilt Gluon kernels that cannot honour the flag;
+        # raise rather than silently running dense.
+        raise ValueError(
+            "block_skip_threshold is not supported on gfx1250 (Gluon kernels)"
+        )
+    # Deferred V load is what makes a skipped tile cheap; PRELOAD_V=1 keeps the
+    # load hoisted (pipelined) but forfeits the bandwidth saving -- A/B only.
+    PRELOAD_V = (not ENABLE_BLOCK_SKIP) or os.environ.get(
+        "AITER_BLASST_PRELOAD_V", "0"
+    ) == "1"
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -435,6 +458,19 @@ def unified_attention(
         total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
+
+    # BLASST is prefill/unified-only in this phase. Disable silently rather than
+    # raising: callers (e.g. ATOM) set one env globally and BOTH prefill and
+    # decode reach this wrapper, so raising would break decode.
+    if ENABLE_BLOCK_SKIP and ALL_DECODE:
+        ENABLE_BLOCK_SKIP = False
+        PRELOAD_V = True
+    # Sliding-window + block-skip is untested (the -inf row sanitizer interacts
+    # with the skip predicate); run dense until it has a regression test.
+    if ENABLE_BLOCK_SKIP and SLIDING_WINDOW > 0:
+        ENABLE_BLOCK_SKIP = False
+        PRELOAD_V = True
+
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,
@@ -543,6 +579,9 @@ def unified_attention(
                 ALL_DECODE=ALL_DECODE,
                 SHUFFLED_KV_CACHE=shuffled_kv_cache,
                 K_WIDTH=K_WIDTH,
+                ENABLE_BLOCK_SKIP=ENABLE_BLOCK_SKIP,
+                PRELOAD_V=PRELOAD_V,
+                log2_threshold=log2_threshold,
                 **config,
             )
         return out
@@ -712,6 +751,9 @@ def unified_attention(
                 K_WIDTH=K_WIDTH,
                 IS_Q_FP8=(q_dtype == e4m3_dtype),
                 IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
+                ENABLE_BLOCK_SKIP=ENABLE_BLOCK_SKIP,
+                PRELOAD_V=PRELOAD_V,
+                log2_threshold=log2_threshold,
                 **attn_config,
             )
 
