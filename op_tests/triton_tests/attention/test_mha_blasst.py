@@ -19,9 +19,9 @@ Self-contained inside AITER. Two references are used, for two different jobs:
     sparse kernel against this leaves only floating-point error, so it can carry
     a tight tolerance and is the actual correctness check.
 
-For SPEEDUP measurement use ``op_tests/op_benchmarks/triton/bench_mha_blasst.py``
--- it captures REAL Qwen3-8B attention patterns, which is required for a
-meaningful speedup number (random tensors rarely produce whole skippable blocks).
+For SPEEDUP measurement use ``op_tests/op_benchmarks/triton/bench_mha_blasst.py``.
+It uses random inputs, which rarely produce whole skippable blocks, so read its
+sparsity columns alongside its timings.
 
 Checks (bf16, causal + non-causal):
   [1] NO-REGRESSION  threshold=0 == dense SDPA
@@ -110,13 +110,13 @@ def blasst_ref(q, k, v, causal, threshold, block_n):
     """Golden reference for the BLASST kernel: FlashAttention online softmax
     with block skipping, in PyTorch.
 
-    Ported from the PyTorch reference implementation of BLASST (MLSys 2026),
+    Ported from the PyTorch reference implementation of BLASST,
     Algorithm 1, with two deliberate changes so that it matches this kernel
-    exactly rather than the paper's pseudocode:
+    exactly rather than published pseudocode:
 
     1. The skip test compares the block max against the running max *before*
        this block (``m_i``), not after folding it in (``m_ij``). See
-       ``BLASST_BLOCK_SKIP_NAN_FIX.md``: for threshold < 1 the two forms are
+       For threshold < 1 the two forms are
        algebraically equivalent, but for threshold > 1 the post-fold form skips
        the very first block unconditionally (``qk_max - m_ij`` is identically 0
        there), leaves ``m_i`` at -inf, and yields NaN.
@@ -312,9 +312,8 @@ def test_blasst_actually_skips(causal):
     barely varies from tile to tile -- so no tile is ever 1000x below the
     running max and the measured skip fraction at 1e-3 is exactly 0.0 (both
     causal and not, every seed and shape tried). That is BLASST behaving
-    correctly on unstructured data, not a bug; real attention is skewed enough
-    for small thresholds to bite, which is what the Qwen3-8B benchmark in
-    op_benchmarks/triton/bench_mha_blasst.py exercises. 0.1 is the smallest
+    correctly on unstructured data, not a bug: real attention scores are skewed
+    enough for small thresholds to bite, random ones are not. 0.1 is the smallest
     threshold that skips a measurable amount here (~1.5%).
     """
     q, k, v = _qkv(1, 4096, 8, 128)

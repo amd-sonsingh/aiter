@@ -459,9 +459,9 @@ def unified_attention(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
 
-    # BLASST is prefill/unified-only in this phase. Disable silently rather than
-    # raising: callers (e.g. ATOM) set one env globally and BOTH prefill and
-    # decode reach this wrapper, so raising would break decode.
+    # Block skipping targets prefill. Disable silently rather than raising: a
+    # caller that enables it once, globally, still reaches this wrapper for both
+    # prefill and decode, so raising here would break decode.
     if ENABLE_BLOCK_SKIP and ALL_DECODE:
         ENABLE_BLOCK_SKIP = False
         PRELOAD_V = True

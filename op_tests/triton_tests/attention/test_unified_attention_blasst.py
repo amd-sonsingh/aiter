@@ -202,13 +202,13 @@ def blasst_ref(
     """Golden reference for the BLASST unified_attention kernels: FlashAttention
     online softmax with block skipping, in PyTorch, for ONE sequence.
 
-    Ported from the PyTorch reference implementation of BLASST (MLSys 2026),
+    Ported from the PyTorch reference implementation of BLASST,
     Algorithm 1, by way of ``op_tests/triton_tests/attention/test_mha_blasst.py``,
     with the changes needed to match the paged/unified kernels rather than the
-    paper's pseudocode:
+    published pseudocode:
 
     1. The skip test compares the tile max against the running max *before* this
-       tile (``M``), not after folding it in. See ``BLASST_BLOCK_SKIP_NAN_FIX.md``:
+       tile (``M``), not after folding it in:
        for threshold < 1 the two forms are algebraically equivalent, but for
        threshold > 1 the post-fold form skips the very first tile
        unconditionally (``s_max - m_j`` is identically 0 there), leaves M at
@@ -672,7 +672,7 @@ def test_blasst_no_nan_above_threshold_one(seq_lens, thr):
     instead makes the difference identically 0 whenever a tile sets a new max --
     including the first tile, where M is -inf. That skips the first tile
     unconditionally, leaves M at -inf, and yields exp2(-inf - -inf) = NaN.
-    See BLASST_BLOCK_SKIP_NAN_FIX.md.
+    
 
     Finiteness only: at log2_threshold > 0 a tile is skipped even when its max is
     ABOVE the running max, which elides nearly everything, so a large deviation

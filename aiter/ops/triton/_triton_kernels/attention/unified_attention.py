@@ -405,7 +405,7 @@ def kernel_unified_attention_2d(
         # their old running max, so the acc/L/M updates below become no-ops for
         # them, and their probabilities are zeroed so they add nothing to acc.
         # Compare against M (the running max BEFORE this tile), never m_j (the
-        # max AFTER folding it in) -- see BLASST_BLOCK_SKIP_NAN_FIX.md. Using
+        # max AFTER folding it in). Using
         # m_j makes the difference identically 0 whenever a tile sets a new max,
         # including the first tile where M is -inf, which skips it
         # unconditionally and leaves M at -inf -> exp2(-inf - -inf) = NaN.
@@ -421,36 +421,46 @@ def kernel_unified_attention_2d(
 
         # For sliding window there's a chance the max is -inf due to masking of
         # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-
-        # P : (BLOCK_M, TILE_SIZE)
-        P = tl.math.exp2(S - m_j[:, None])
-        if ENABLE_BLOCK_SKIP:
-            P = tl.where(skip[:, None], 0.0, P)
-
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
-
-        # alpha : (BLOCK_M, )
-        alpha = tl.math.exp2(M - m_j)
-        # Defensive: skip implies m_j == M (finite), so alpha is already 1.0.
-        # Kept as cheap insurance against an inf - inf -> NaN regression.
-        if ENABLE_BLOCK_SKIP:
-            alpha = tl.where(skip, 1.0, alpha)
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
-
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        # When every row skips this tile the V load and the P@V matmul
-        # contribute nothing -- elide both. When ENABLE_BLOCK_SKIP is False,
-        # all_skip is a Python False so this folds away at compile time and the
-        # dense path emits identical IR.
+        # When EVERY row skips this tile the entire online-softmax update below
+        # is provably a no-op, so elide all of it -- not just the V load and the
+        # P@V matmul:
+        #   all rows skip  =>  m_j == M  =>  alpha = exp2(M - M) = 1
+        #   P is zeroed    =>  l_j = 0
+        # hence acc *= 1, L = L*1 + 0, M = m_j = M: nothing changes. Leaving it
+        # in cost a full BLOCK_M x TILE_SIZE exp2, a row-sum, and a
+        # BLOCK_M x HEAD_SIZE accumulator rescale per elided tile, which is why
+        # a high tile-elision rate did not translate into speedup.
+        #
+        # This reuses the SAME `if` the dot already needed rather than adding a
+        # second region: an extra scf.if boundary is what defeats the AMD
+        # backend's chain-dot detection and costs the tuned warpsPerCTA=[4,1].
+        #
+        # With ENABLE_BLOCK_SKIP False, all_skip is a Python False, so this folds
+        # at compile time and the dense path emits identical IR.
         if not (ENABLE_BLOCK_SKIP and all_skip):
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+            # P : (BLOCK_M, TILE_SIZE)
+            P = tl.math.exp2(S - m_j[:, None])
+            if ENABLE_BLOCK_SKIP:
+                P = tl.where(skip[:, None], 0.0, P)
+
+            # l_j : (BLOCK_M,)
+            l_j = tl.sum(P, axis=1)
+
+            # alpha : (BLOCK_M, )
+            alpha = tl.math.exp2(M - m_j)
+            # Defensive: skip implies m_j == M (finite), so alpha is already 1.0.
+            # Kept as cheap insurance against an inf - inf -> NaN regression.
+            if ENABLE_BLOCK_SKIP:
+                alpha = tl.where(skip, 1.0, alpha)
+
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            acc = acc * alpha[:, None]
+
+            # update constants
+            L = L * alpha + l_j
+            M = m_j
+
             if not PRELOAD_V:
                 V_load = tl.load(
                     value_cache_ptr + v_offset,
@@ -869,7 +879,7 @@ def kernel_unified_attention_3d(
 
         # BLASST block skipping -- see the 2D kernel for the full rationale.
         # Compare against M (running max BEFORE this tile), never m_j, or
-        # thresholds > 1.0 produce NaN (BLASST_BLOCK_SKIP_NAN_FIX.md).
+        # thresholds > 1.0 produce NaN.
         # NOTE: in this 3D kernel M is reset to -inf at the start of every
         # segment, so skip decisions are segment-local: the first tile of each
         # segment never skips and comparisons use a segment-local running max.
@@ -883,33 +893,45 @@ def kernel_unified_attention_3d(
 
         # For sliding window there's a chance the max is -inf due to masking of
         # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-
-        # P : (BLOCK_M, TILE_SIZE,)
-        P = tl.math.exp2(S - m_j[:, None])
-        if ENABLE_BLOCK_SKIP:
-            P = tl.where(skip[:, None], 0.0, P)
-
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
-
-        # alpha : (BLOCK_M, )
-        alpha = tl.math.exp2(M - m_j)
-        # Defensive: skip implies m_j == M (finite), so alpha is already 1.0.
-        if ENABLE_BLOCK_SKIP:
-            alpha = tl.where(skip, 1.0, alpha)
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
-
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        # Elide the V load and the P@V matmul when every row skips this tile.
-        # Folds away at compile time when ENABLE_BLOCK_SKIP is False.
+        # When EVERY row skips this tile the entire online-softmax update below
+        # is provably a no-op, so elide all of it -- not just the V load and the
+        # P@V matmul:
+        #   all rows skip  =>  m_j == M  =>  alpha = exp2(M - M) = 1
+        #   P is zeroed    =>  l_j = 0
+        # hence acc *= 1, L = L*1 + 0, M = m_j = M: nothing changes. Leaving it
+        # in cost a full BLOCK_M x TILE_SIZE exp2, a row-sum, and a
+        # BLOCK_M x HEAD_SIZE accumulator rescale per elided tile, which is why
+        # a high tile-elision rate did not translate into speedup.
+        #
+        # This reuses the SAME `if` the dot already needed rather than adding a
+        # second region: an extra scf.if boundary is what defeats the AMD
+        # backend's chain-dot detection and costs the tuned warpsPerCTA=[4,1].
+        #
+        # With ENABLE_BLOCK_SKIP False, all_skip is a Python False, so this folds
+        # at compile time and the dense path emits identical IR.
         if not (ENABLE_BLOCK_SKIP and all_skip):
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+            # P : (BLOCK_M, TILE_SIZE,)
+            P = tl.math.exp2(S - m_j[:, None])
+            if ENABLE_BLOCK_SKIP:
+                P = tl.where(skip[:, None], 0.0, P)
+
+            # l_j : (BLOCK_M,)
+            l_j = tl.sum(P, axis=1)
+
+            # alpha : (BLOCK_M, )
+            alpha = tl.math.exp2(M - m_j)
+            # Defensive: skip implies m_j == M (finite), so alpha is already 1.0.
+            if ENABLE_BLOCK_SKIP:
+                alpha = tl.where(skip, 1.0, alpha)
+
+            # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+            acc = acc * alpha[:, None]
+
+            # update constants
+            L = L * alpha + l_j
+            M = m_j
+
             if not PRELOAD_V:
                 V_load = tl.load(
                     value_cache_ptr + v_offset,

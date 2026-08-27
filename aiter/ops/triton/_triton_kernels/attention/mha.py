@@ -222,59 +222,92 @@ def _attn_fwd_inner(
         # to the accumulator.
         if ENABLE_BLOCK_SKIP:
             skip = (qk_max - m_i) < log2_threshold
-            all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
+            # The all-rows-skip fast path below elides the whole softmax update,
+            # including the tl.store of the dropout mask and of the score matrix.
+            # Those stores are observable side effects that the backward pass
+            # reads back, so dropping them would silently change behaviour, not
+            # just performance. Only arm the fast path when neither is requested;
+            # both are tl.constexpr, so when either is set all_skip becomes a
+            # Python False and every guard below folds away at compile time
+            # (block skipping then still zeroes skipped rows' probabilities, it
+            # just no longer elides tiles).
+            if ENABLE_DROPOUT or RETURN_SCORES:
+                all_skip = False
+            else:
+                all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
             m_ij = tl.where(skip, m_i, m_ij)
         else:
             all_skip = False
 
-        # Compute scaled QK and softmax probabilities
-        p = tl.math.exp2(qk - m_ij[:, None])
-        if ENABLE_BLOCK_SKIP:
-            p = tl.where(skip[:, None], 0.0, p)
-
-        if SLIDING_WINDOW > 0:
-            # When all qk in a row are -inf (fully out-of-window block) and m_i was -inf,
-            # exp2(-inf - (-inf)) = NaN. Sanitize by zeroing masked elements.
-            p = tl.where(mask, p, 0.0)
-
-        # CAVEAT: Must update l_ij before applying dropout
-        l_ij = tl.sum(p, 1)
-        if ENABLE_DROPOUT:
-            rng_output = tl.rand(
-                philox_seed, philox_ptrs
-            )  # TODO: use tl.randint for better performance
-            dropout_mask = rng_output > dropout_p
-            tl.store(dropout_mask_ptrs, dropout_mask, mask=p_mask)
-
-            # return scores with negative values for dropped vals
-            sd_mask = tl.where(dropout_mask, p, -p)
-            tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
-
-            # apply dropout mask in place
-            p = tl.where(dropout_mask, p, 0.0)
-        elif RETURN_SCORES:
-            # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-            tl.store(sd_mask_ptrs, p, mask=p_mask)
-
-        # -- update output accumulator --
-        # alpha is an adjustment factor for acc and li as we loop and find new maxes
-        # store the diff in maxes to adjust acc and li as we discover new maxes
-        alpha = tl.math.exp2(m_i - m_ij)
-        if SLIDING_WINDOW > 0:
-            # When m_i == m_ij == -inf, exp2(-inf - (-inf)) = NaN. alpha should be 1.0
-            # (no rescaling needed since max didn't change).
-            alpha = tl.where(m_i == m_ij, 1.0, alpha)
-        acc = acc * alpha[:, None]
-        # -- update m_i and l_i
-        l_i = l_i * alpha + l_ij
-        # update m_i and l_i
-        m_i = m_ij
-        # When every row skips this block (BLASST), the V load and the P@V matmul
-        # contribute nothing — skip both. This is where the memory-bandwidth and
-        # compute savings come from. Requires PRELOAD_V=False (forced by the
-        # wrapper when block skipping is enabled) so the V load is deferred here
-        # and can be elided.
+        # When EVERY row skips this block the entire online-softmax update below
+        # is provably a no-op, so elide all of it -- not just the V load and the
+        # P@V matmul:
+        #   all rows skip  =>  m_ij == m_i  =>  alpha = exp2(m_i - m_i) = 1
+        #   p is zeroed    =>  l_ij = 0
+        # hence acc *= 1, l_i = l_i*1 + 0, m_i = m_ij = m_i: nothing changes.
+        # Leaving it in cost a full BLOCK_M x BLOCK_N exp2, a row-sum and a
+        # BLOCK_M x BLOCK_DMODEL accumulator rescale per elided block, which is
+        # why a high block-elision rate did not translate into speedup.
+        # (m_i == -inf cannot coexist with all_skip: qk_max - (-inf) is +inf or
+        # NaN, neither of which is < log2_threshold, so no row skips then. The
+        # SLIDING_WINDOW alpha/p sanitizers below therefore have nothing to do on
+        # an elided block and eliding them is safe.)
+        #
+        # This reuses the SAME `if` the dot already needed rather than adding a
+        # second region: an extra scf.if boundary is what defeats the AMD
+        # backend's chain-dot detection and costs the tuned warpsPerCTA=[4,1].
+        #
+        # With ENABLE_BLOCK_SKIP False, all_skip is a Python False, so this folds
+        # at compile time and the dense path emits identical IR.
         if not (ENABLE_BLOCK_SKIP and all_skip):
+            # Compute scaled QK and softmax probabilities
+            p = tl.math.exp2(qk - m_ij[:, None])
+            if ENABLE_BLOCK_SKIP:
+                p = tl.where(skip[:, None], 0.0, p)
+
+            if SLIDING_WINDOW > 0:
+                # When all qk in a row are -inf (fully out-of-window block) and m_i was -inf,
+                # exp2(-inf - (-inf)) = NaN. Sanitize by zeroing masked elements.
+                p = tl.where(mask, p, 0.0)
+
+            # CAVEAT: Must update l_ij before applying dropout
+            l_ij = tl.sum(p, 1)
+            if ENABLE_DROPOUT:
+                rng_output = tl.rand(
+                    philox_seed, philox_ptrs
+                )  # TODO: use tl.randint for better performance
+                dropout_mask = rng_output > dropout_p
+                tl.store(dropout_mask_ptrs, dropout_mask, mask=p_mask)
+
+                # return scores with negative values for dropped vals
+                sd_mask = tl.where(dropout_mask, p, -p)
+                tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
+
+                # apply dropout mask in place
+                p = tl.where(dropout_mask, p, 0.0)
+            elif RETURN_SCORES:
+                # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
+                tl.store(sd_mask_ptrs, p, mask=p_mask)
+
+            # -- update output accumulator --
+            # alpha is an adjustment factor for acc and li as we loop and find new maxes
+            # store the diff in maxes to adjust acc and li as we discover new maxes
+            alpha = tl.math.exp2(m_i - m_ij)
+            if SLIDING_WINDOW > 0:
+                # When m_i == m_ij == -inf, exp2(-inf - (-inf)) = NaN. alpha should be 1.0
+                # (no rescaling needed since max didn't change).
+                alpha = tl.where(m_i == m_ij, 1.0, alpha)
+            acc = acc * alpha[:, None]
+            # -- update m_i and l_i
+            l_i = l_i * alpha + l_ij
+            # update m_i and l_i
+            m_i = m_ij
+
+            # The V load and the P@V matmul contribute nothing on an elided
+            # block either. This is where the memory-bandwidth and compute
+            # savings come from. Requires PRELOAD_V=False (forced by the wrapper
+            # when block skipping is enabled) so the V load is deferred here and
+            # can be elided.
             if not PRELOAD_V:
                 v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
             if IS_FP8:
